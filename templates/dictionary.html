@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="ja">
+
+<head>
+    <meta charset="UTF-8">
+    <title>氏名辞書</title>
+
+    <style>
+
+        body{
+            font-family: sans-serif;
+            margin:40px;
+        }
+
+        table{
+            border-collapse: collapse;
+            width: 500px;
+        }
+
+        th, td{
+            border:1px solid #ccc;
+            padding:8px;
+        }
+
+        input{
+            padding:8px;
+            margin-right:10px;
+        }
+
+        button{
+            padding:8px 16px;
+        }
+
+    </style>
+
+</head>
+
+<body>
+
+    <h1>氏名辞書</h1>
+
+    <form method="POST" action="/dictionary/add">
+
+        <input
+            type="text"
+            name="alias"
+            placeholder="PDF表記"
+            required
+        >
+
+        <input
+            type="text"
+            name="real_name"
+            placeholder="正式氏名"
+            required
+        >
+
+        <button type="submit">
+            追加
+        </button>
+
+    </form>
+
+    <br>
+
+    <table>
+
+        <tr>
+            <th>PDF表記</th>
+            <th>正式氏名</th>
+        </tr>
+
+        {% for row in rows %}
+
+        <tr>
+            <td>{{ row.alias }}</td>
+            <td>{{ row.real_name }}</td>
+        </tr>
+
+        {% endfor %}
+
+    </table>
+
+</body>
+</html>
