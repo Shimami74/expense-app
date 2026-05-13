@@ -2,6 +2,19 @@ from flask import Flask, render_template, request, send_file, redirect, url_for
 import os
 import sqlite3
 import csv
+
+def load_dictionary():
+    d = {}
+    try:
+        with open("name_dictionary.csv", encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                d[row["alias"]] = row["real_name"]
+    except:
+        pass
+    return d
+
+
 from pathlib import Path
 import uuid
 
@@ -43,15 +56,10 @@ def upload():
 
     result = process_pdf(pdf_path, output_excel)
 
-    from openpyxl import load_workbook
+    #if result is None:
+        #raise Exception("process_pdfがNoneを返しています（parser.py確認）")
 
-    wb = load_workbook(output_excel)
-    ws = wb["抽出データ_氏名あり"]
-
-    ws.auto_filter.ref = ws.dimensions
-
-    wb.save(output_excel)
-    wb.close()
+    print("DEBUG result:", result)
 
     # PRGパターン（重要）
     return render_template(

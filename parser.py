@@ -1,478 +1,213 @@
-from pathlib import Path
+import pdfplumber
 import re
-import csv
-import fitz  # PyMuPDF
 import pandas as pd
+import csv
 
-from db import init_db, save_to_db
-
+from openpyxl.styles import Font
 from openpyxl.utils import get_column_letter
-
-# Janomeを使う場合
-# pip install janome
-try:
-    from janome.tokenizer import Tokenizer
-
-    tokenizer = Tokenizer()
-    JANOME_AVAILABLE = True
-
-except:
-    JANOME_AVAILABLE = False
+from openpyxl import load_workbook
 
 
-# =========================
-# 設定
-# =========================
-DEBUG_PARSED = "debug_parsed_entries.txt"
-
-NAME_DICTIONARY_FILE = "name_dictionary.csv"
-
-
-# =========================
-# ユーティリティ
-# =========================
-def clean_text(s: str) -> str:
-
-    if s is None:
-        return ""
-
-    s = str(s)
-
-    s = s.replace("\u3000", " ")
-    s = s.replace("\xa0", " ")
-    s = s.replace("\r", "")
-
-    return s.strip()
-
-
-def normalize_spaces(s: str) -> str:
-    return re.sub(r"[ \t]+", " ", clean_text(s))
-
-
-def load_name_dictionary():
-
-    result = {}
-
-    path = Path(NAME_DICTIONARY_FILE)
-
-    if not path.exists():
-        return result
-
-    with open(path, "r", encoding="utf-8-sig") as f:
-
-        reader = csv.DictReader(f)
-
-        for row in reader:
-
-            alias = clean_text(row.get("alias"))
-            real_name = clean_text(row.get("real_name"))
-
-            if alias and real_name:
-
-                alias = alias.strip()
-                real_name = real_name.strip()
-
-                result[alias] = real_name
-
-    return result
-
-
-# 学習辞書読込
-CUSTOM_NAME_DICT = load_name_dictionary()
-
-
-def to_int_amount(s: str) -> int:
-    return int(str(s).replace(",", "").strip())
-
-
-def normalize_name(name: str) -> str:
-
-    if not name:
-        return ""
-
-    name = clean_text(name)
-
-    # 不要文字除去
-    name = re.sub(r"[■□№]", "", name)
-
-    # 全角スペース除去
-    name = name.replace("\u3000", "")
-
-    name = name.strip()
-
-    # 学習辞書
-    if name in CUSTOM_NAME_DICT:
-        return CUSTOM_NAME_DICT[name]
-
-    return name
-
-
-# =========================
-# PDFテキスト取得
-# =========================
-def extract_page_lines(pdf_path: Path):
-
-    pages = []
-
-    doc = fitz.open(str(pdf_path))
+def load_dictionary():
+    d = {}
 
     try:
-        for page_no in range(len(doc)):
+        with open("name_dictionary.csv", encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
 
-            page = doc.load_page(page_no)
+            for row in reader:
+                d[row["alias"]] = row["real_name"]
 
-            text = page.get_text("text", sort=True) or ""
+    except:
+        pass
 
-            lines = [
-                clean_text(line)
-                for line in text.splitlines()
-            ]
-
-            # 空行除去
-            lines = [line for line in lines if line]
-
-            pages.append((page_no + 1, lines))
-
-    finally:
-        doc.close()
-
-    return pages
+    return d
 
 
 # =========================
-# 明細開始判定
+# PDF全文抽出
 # =========================
-def is_entry_start_line(line: str) -> bool:
+def extract_text(pdf_path):
 
-    line = normalize_spaces(line)
+    text = ""
 
-    return bool(
-        re.match(
-            r"^\d{4}/\d{2}/\d{2}\s+\d{4}/\d{2}/\d{2}\s+83330\s+旅費\b",
-            line
-        )
-    )
+    with pdfplumber.open(pdf_path) as pdf:
 
+        for page in pdf.pages:
 
-# =========================
-# 金額抽出
-# =========================
-def extract_amounts_from_line1(line1: str):
+            t = page.extract_text()
 
-    s = normalize_spaces(line1)
+            if t:
+                text += t + "\n"
 
-    nums = re.findall(r"\d{1,3}(?:,\d{3})*", s)
-
-    if len(nums) < 2:
-        return None, None
-
-    debit = to_int_amount(nums[-2])
-    balance = to_int_amount(nums[-1])
-
-    return debit, balance
+    return text
 
 
 # =========================
-# 伝票番号等抽出
+# 名前抽出
 # =========================
-def extract_slip_and_subcode_from_line2(line2: str):
+def extract_name(text):
 
-    s = normalize_spaces(line2)
+    m = re.search(r'■([^\s]+)', text)
 
-    m = re.match(
-        r"^(?P<slip>G\d+)\s+(?P<subcode>7101[23])\s+(?P<subname>.+)$",
-        s
-    )
-
-    if not m:
-        return "", "", ""
-
-    return (
-        m.group("slip"),
-        m.group("subcode"),
-        m.group("subname")
-    )
-
-
-# =========================
-# 部門情報抽出
-# =========================
-def extract_line_no_and_dept_from_line3(line3: str):
-
-    s = normalize_spaces(line3)
-
-    m = re.match(
-        r"^(?P<line_no>\d+)\s+(?P<tax>\S+)\s+(?P<dept_code>\d+)\s+(?P<dept_name>.+)$",
-        s
-    )
-
-    if not m:
-        return "", "", "", ""
-
-    return (
-        m.group("line_no"),
-        m.group("tax"),
-        m.group("dept_code"),
-        m.group("dept_name")
-    )
-
-
-# =========================
-# 摘要
-# =========================
-def extract_description_from_line4(line4: str):
-    return clean_text(line4)
-
-
-# =========================
-# 氏名抽出
-# =========================
-
-COMMON_NON_NAMES = {
-    "東京", "大阪", "会議", "打合", "レンタカー",
-    "高速代", "宿泊", "技術", "建設", "補修",
-    "タクシー", "新幹線", "立替", "精算",
-    "駐車場", "ガソリン", "羽田", "伊丹",
-    "品川", "名古屋", "福岡"
-}
-
-NAME_PATTERNS = [
-
-    # ■山本健太
-    {
-        "pattern": r"■([一-龥々ぁ-んァ-ヶ]{2,8})",
-        "score": 10
-    },
-
-    # 山本健太2/2№46593
-    {
-        "pattern": r"([一-龥々ぁ-んァ-ヶ]{2,8})(?=\d{1,2}/\d{1,2})",
-        "score": 8
-    },
-
-    # 山本健太 03/02
-    {
-        "pattern": r"([一-龥々ぁ-んァ-ヶ]{2,8})(?=\s+\d{1,2}/\d{1,2})",
-        "score": 7
-    },
-
-    # 山本健太MF49130
-    {
-        "pattern": r"([一-龥々ぁ-んァ-ヶ]{2,8})(?=\s*MF\d+)",
-        "score": 8
-    },
-
-    # 山本健太 41725000-20
-    {
-        "pattern": r"([一-龥々ぁ-んァ-ヶ]{2,8})(?=\s+\d{5,}(?:-\d+)?)",
-        "score": 6
-    },
-
-    # 行末
-    {
-        "pattern": r"(?:\s|　)([一-龥々ぁ-んァ-ヶ]{2,8})$",
-        "score": 3
-    },
-]
-
-
-def score_name(name: str) -> int:
-
-    if not name:
-        return -999
-
-    if name in COMMON_NON_NAMES:
-        return -999
-
-    score = 0
-
-    # フルネームっぽい
-    if 4 <= len(name) <= 6:
-        score += 5
-
-    # 姓のみ
-    elif 2 <= len(name) <= 3:
-        score += 2
-
-    # 数字混じり除外
-    if re.search(r"\d", name):
-        score -= 10
-
-    # 英字混じり除外
-    if re.search(r"[A-Za-z]", name):
-        score -= 10
-
-    return score
-
-
-def extract_name(desc: str) -> str:
-
-    desc = clean_text(desc)
-
-    candidates = []
-
-    # =====================
-    # 正規表現抽出
-    # =====================
-    for item in NAME_PATTERNS:
-
-        pattern = item["pattern"]
-        base_score = item["score"]
-
-        matches = re.finditer(pattern, desc)
-
-        for m in matches:
-
-            try:
-                name = normalize_name(m.group(1))
-
-            except:
-                continue
-
-            score = base_score + score_name(name)
-
-            candidates.append({
-                "name": name,
-                "score": score
-            })
-
-    # スコア順
-    if candidates:
-
-        candidates.sort(
-            key=lambda x: x["score"],
-            reverse=True
-        )
-
-        best = candidates[0]["name"]
-
-        return best
-
-    # =====================
-    # Janome fallback
-    # =====================
-    if JANOME_AVAILABLE:
-
-        for token in tokenizer.tokenize(desc):
-
-            pos = token.part_of_speech.split(",")
-
-            if (
-                pos[0] == "名詞"
-                and pos[1] == "固有名詞"
-                and pos[2] == "人名"
-            ):
-
-                name = normalize_name(token.surface)
-
-                if score_name(name) > 0:
-                    return name
+    if m:
+        return m.group(1).strip()
 
     return ""
 
 
 # =========================
-# 明細抽出
+# 伝票番号
 # =========================
-def parse_entries_from_pages(pages):
+def extract_voucher(text):
 
-    rows = []
-    debug_rows = []
+    m = re.search(r"G\d{9}", text)
 
-    for page_no, lines in pages:
-
-        i = 0
-
-        while i < len(lines):
-
-            line1 = lines[i]
-
-            if not is_entry_start_line(line1):
-                i += 1
-                continue
-
-            if i + 3 >= len(lines):
-                break
-
-            line2 = lines[i + 1]
-            line3 = lines[i + 2]
-            line4 = lines[i + 3]
-
-            # G番号確認
-            if not re.match(r"^G\d+", normalize_spaces(line2)):
-                i += 1
-                continue
-
-            debit, balance = extract_amounts_from_line1(line1)
-
-            slip_no, subcode, subname = (
-                extract_slip_and_subcode_from_line2(line2)
-            )
-
-            line_no, tax, dept_code, dept_name = (
-                extract_line_no_and_dept_from_line3(line3)
-            )
-
-            desc = extract_description_from_line4(line4)
-
-            name = extract_name(desc)
-
-            rows.append({
-                "ページ": page_no,
-                "計上行": normalize_spaces(line1),
-                "伝票番号": slip_no,
-                "相手補助科目コード": subcode,
-                "相手補助科目": subname,
-                "行": line_no,
-                "税": tax,
-                "部門コード": dept_code,
-                "部門名": dept_name,
-                "摘要": desc,
-                "氏名": name,
-                "借方金額": debit if debit is not None else None,
-                "残高": balance if balance is not None else None,
-            })
-
-            debug_rows.append(
-                f"[PAGE {page_no}] "
-                f"伝票={slip_no}, "
-                f"行={line_no}, "
-                f"借方={debit}, "
-                f"氏名={name}, "
-                f"摘要={desc}"
-            )
-
-            i += 4
-
-    with open(DEBUG_PARSED, "w", encoding="utf-8") as f:
-
-        for row in debug_rows:
-            f.write(row + "\n")
-
-    return pd.DataFrame(rows)
+    return m.group(0) if m else ""
 
 
 # =========================
-# Excel列幅調整
+# 部門名
 # =========================
-def auto_adjust_columns(writer, sheet_name, df):
+def extract_department(line):
 
-    ws = writer.sheets[sheet_name]
+    m = re.search(r"\d{5}\s+(.+?)\s+諸口", line)
 
-    for idx, col in enumerate(df.columns, start=1):
+    if m:
+        return m.group(1).strip()
 
-        max_len = len(str(col))
+    return ""
 
-        for v in df[col].astype(str).fillna(""):
 
-            max_len = max(
-                max_len,
-                len(str(v))
-            )
+# =========================
+# 行解析
+# =========================
+def parse_record(lines):
 
-        ws.column_dimensions[
-            get_column_letter(idx)
-        ].width = min(max_len + 2, 80)
+    """
+    1レコード例
+
+    2026/04/06
+    G001949584
+    1 71込 96061 技術　トンネル・基礎
+    諸口 27,200 27,200
+    71013 社外
+    中央復建コンサルタンツ...■岡部正...
+    """
+
+    joined = " ".join(lines)
+
+    # 計上日
+    date = ""
+
+    for l in lines:
+        if re.match(r"\d{4}/\d{2}/\d{2}", l):
+            date = l
+            break
+
+    voucher = extract_voucher(joined)
+
+    # 行情報
+    line_info = ""
+
+    for l in lines:
+        if re.match(r"^\d+\s+\S+\s+\d{5}", l):
+            line_info = l
+            break
+
+    # 金額行
+    amount_line = ""
+
+    for l in lines:
+        if "諸口" in l or "付替仮勘定" in l or "未払金" in l:
+            amount_line = l
+            break
+
+    # 借方金額
+    amount = None
+
+    m = re.search(
+        r"(?:諸口|付替仮勘定|未払金)\s+([\d,]+)\s+[\d,]+",
+        amount_line
+    )
+
+    if m:
+        amount = int(m.group(1).replace(",", ""))
+
+    # 行番号・税・部門コード
+    行 = ""
+    税 = ""
+    部門コード = ""
+
+    m = re.match(r"^(\d+)\s+(\S+)\s+(\d{5})", line_info)
+
+    if m:
+        行 = m.group(1)
+        税 = m.group(2)
+        部門コード = m.group(3)
+
+    部門名 = extract_department(line_info)
+
+    name = extract_name(joined)
+
+    return {
+        "ページ": "",
+        "計上行": date,
+        "伝票番号": voucher,
+        "相手補助科目コード": "",
+        "相手補助科目": "",
+        "行": 行,
+        "税": 税,
+        "部門コード": 部門コード,
+        "部門名": 部門名,
+        "摘要": joined,
+        "氏名": name,
+        "借方金額": amount,
+        "残高": ""
+    }
+
+
+# =========================
+# レコード分割
+# =========================
+def split_records(text):
+
+    lines = text.split("\n")
+
+    records = []
+    current = []
+
+    inside = False
+
+    for line in lines:
+
+        line = line.strip()
+
+        if not line:
+            continue
+
+        # ヘッダ除外
+        if "総勘定元帳" in line:
+            continue
+
+        # 新レコード開始
+        if re.match(r"\d{4}/\d{2}/\d{2}", line):
+
+            if current:
+                records.append(current)
+
+            current = [line]
+            inside = True
+
+            continue
+
+        if inside:
+            current.append(line)
+
+    if current:
+        records.append(current)
+
+    return records
 
 
 # =========================
@@ -480,55 +215,79 @@ def auto_adjust_columns(writer, sheet_name, df):
 # =========================
 def process_pdf(pdf_path, output_excel):
 
-    print("===================================")
-    print("PDF読込開始")
-    print("===================================")
+    dictionary = load_dictionary()
 
-    if not pdf_path.exists():
+    text = extract_text(pdf_path)
 
-        print("PDFが見つかりません。")
-        return
+    records = split_records(text)
 
-    pages = extract_page_lines(pdf_path)
+    rows = []
 
-    df = parse_entries_from_pages(pages)
+    unknown_rows = []
 
-    print("debug解析結果出力:", DEBUG_PARSED)
+    total_amount = 0
 
-    if df.empty:
+    for r in records:
 
-        print("取引データを抽出できませんでした。")
-        return
+        row = parse_record(r)
 
-    # 氏名あり/なし
-    unknown_df = df[df["氏名"] == ""].copy()
+        if not row["借方金額"]:
+            continue
 
-    named_df = df[df["氏名"] != ""].copy()
-
-    # 氏名別集計
-    summary = (
-        named_df
-        .groupby("氏名", as_index=False)["借方金額"]
-        .sum()
-        .rename(columns={
-            "借方金額": "合計借方金額"
-        })
-        .sort_values(
-            "合計借方金額",
-            ascending=False
+        # 名前辞書変換
+        row["氏名"] = dictionary.get(
+            row["氏名"],
+            row["氏名"]
         )
+
+        rows.append(row)
+
+        total_amount += row["借方金額"]
+
+        if not row["氏名"]:
+            unknown_rows.append(row)
+
+    # =========================
+    df = pd.DataFrame(rows)
+
+    columns = [
+        "ページ",
+        "計上行",
+        "伝票番号",
+        "相手補助科目コード",
+        "相手補助科目",
+        "行",
+        "税",
+        "部門コード",
+        "部門名",
+        "摘要",
+        "氏名",
+        "借方金額",
+        "残高"
+    ]
+
+    df = df[columns]
+
+    df["氏名"] = df["氏名"].replace("", "未抽出")
+
+    # =========================
+    # 集計
+    # =========================
+    summary = (
+        df.groupby("氏名", as_index=False)["借方金額"]
+        .sum()
+        .rename(columns={"借方金額": "合計借方金額"})
+        .sort_values(by="合計借方金額", ascending=False)
     )
 
-    total_all_rows = df["借方金額"].fillna(0).sum()
+    # =========================
+    # Excel出力
+    # =========================
+    with pd.ExcelWriter(output_excel, engine="openpyxl") as writer:
 
-    with pd.ExcelWriter(
-        str(output_excel),
-        engine="openpyxl"
-    ) as writer:
-
-        named_df.to_excel(
+        df.to_excel(
             writer,
-            sheet_name="抽出データ_氏名あり",
+            sheet_name="抽出データ",
             index=False
         )
 
@@ -538,91 +297,49 @@ def process_pdf(pdf_path, output_excel):
             index=False
         )
 
-        if not unknown_df.empty:
-
-            unknown_df.to_excel(
-                writer,
-                sheet_name="氏名未抽出_要確認",
-                index=False
-            )
-
-        auto_adjust_columns(
+        pd.DataFrame(unknown_rows).to_excel(
             writer,
-            "抽出データ_氏名あり",
-            named_df
+            sheet_name="未抽出",
+            index=False
         )
 
-        auto_adjust_columns(
-            writer,
-            "氏名別集計",
-            summary
-        )
+    # =========================
+    # openpyxl編集
+    # =========================
+    wb = load_workbook(output_excel)
 
-        if not unknown_df.empty:
+    for ws in wb.worksheets:
 
-            auto_adjust_columns(
-                writer,
-                "氏名未抽出_要確認",
-                unknown_df
-            )
+        # ヘッダ太字
+        for cell in ws[1]:
+            cell.font = Font(bold=True)
 
-        # 金額フォーマット
-        for sheet_name in writer.sheets:
+        # フィルター
+        ws.auto_filter.ref = ws.dimensions
 
-            ws = writer.sheets[sheet_name]
+        # 列幅自動
+        for col in ws.columns:
 
-            headers = {
-                ws.cell(row=1, column=col).value: col
-                for col in range(1, ws.max_column + 1)
-            }
+            max_len = 0
 
-            for money_col_name in [
-                "借方金額",
-                "合計借方金額",
-                "残高"
-            ]:
+            col_letter = get_column_letter(col[0].column)
 
-                if money_col_name in headers:
+            for cell in col:
 
-                    col_idx = headers[money_col_name]
+                try:
+                    max_len = max(
+                        max_len,
+                        len(str(cell.value))
+                    )
+                except:
+                    pass
 
-                    for row in range(2, ws.max_row + 1):
+            ws.column_dimensions[col_letter].width = min(max_len + 2, 60)
 
-                        ws.cell(
-                            row=row,
-                            column=col_idx
-                        ).number_format = "#,##0"
-
-    print("\n===================================")
-    print("完了")
-    print("===================================")
-
-    print(f"Excelを出力しました: {output_excel}")
-    print(f"抽出した取引件数: {len(df)}")
-    print(f"借方合計: {total_all_rows:,}")
-
-    if not unknown_df.empty:
-
-        print(f"氏名未抽出件数: {len(unknown_df)}")
-        print("『氏名未抽出_要確認』シートを確認してください。")
-
-    else:
-        print("すべての行で氏名を抽出できました。")
-
-    print("\n=== 氏名別集計（上位20件） ===")
-
-    print(
-        summary.head(20).to_string(index=False)
-    )
-
-    # DB保存
-    init_db()
-
-    save_to_db(df)
+    wb.save(output_excel)
 
     return {
-        "output_excel": output_excel,
         "total_rows": len(df),
-        "unknown_count": len(unknown_df),
-        "total_amount": int(total_all_rows),
+        "unknown_count": len(unknown_rows),
+        "total_amount": total_amount
     }
