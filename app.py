@@ -43,6 +43,16 @@ def upload():
 
     result = process_pdf(pdf_path, output_excel)
 
+    from openpyxl import load_workbook
+
+    wb = load_workbook(output_excel)
+    ws = wb["抽出データ_氏名あり"]
+
+    ws.auto_filter.ref = ws.dimensions
+
+    wb.save(output_excel)
+    wb.close()
+
     # PRGパターン（重要）
     return render_template(
         "index.html",
